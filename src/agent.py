@@ -1,6 +1,6 @@
-
 import logging
 import textwrap
+import time
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -25,7 +25,6 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             llm=inference.LLM(model="google/gemma-4-31b-it"),
-
             instructions=textwrap.dedent(
                 """\
                 You are ONEXA, a personal AI voice assistant shared by Ali Hassan and his business partner Hamza.
@@ -95,29 +94,65 @@ async def my_agent(ctx: JobContext):
             model="assemblyai/assemblyai-stt-3-7-realtime-agent",
             language="en",
         ),
-
         stt_context_options=STTContextOptions(
             keyterms=["ONEXA", "Ali Hassan", "Hamza"],
             keyterm_detection={"enabled": True},
         ),
-
         tts=inference.TTS(
             model="fishaudio/s2.1-pro",
             voice="fa4c9eb3dccc4806b382b40d61c6b10a",
         ),
-
         turn_handling=TurnHandlingOptions(
             turn_detection=inference.TurnDetector(),
             preemptive_generation={"enabled": True},
         ),
-
         expressive=True,
     )
+
+    speech_started_at = 0.0
+
+    @session.on("user_state_changed")
+    def on_user_state_changed(event):
+        nonlocal speech_started_at
+        new_state = getattr(event.new_state, "value", event.new_state)
+        if new_state == "speaking":
+            speech_started_at = time.perf_counter()
+            logger.info("User speech detected")
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(event):
+        if speech_started_at:
+            logger.info(
+                "User transcript available: final=%s speech_to_transcript_ms=%.0f",
+                event.is_final,
+                (time.perf_counter() - speech_started_at) * 1000,
+            )
+
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(event):
+        item = event.item
+        metrics = getattr(item, "metrics", None) or {}
+        latency_fields = (
+            "transcription_delay",
+            "end_of_turn_delay",
+            "llm_node_ttft",
+            "tts_node_ttfb",
+            "e2e_latency",
+        )
+        latency = {
+            field: round(value, 3)
+            for field in latency_fields
+            if isinstance((value := metrics.get(field)), (int, float))
+        }
+        if latency:
+            logger.info("Turn latency: role=%s metrics_seconds=%s", item.role, latency)
 
     await session.start(
         agent=Assistant(),
         room=ctx.room,
         room_options=room_io.RoomOptions(
+            # Keep captions aligned with the audio that the user hears.
+            text_output=room_io.TextOutputOptions(sync_transcription=True),
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=ai_coustics.audio_enhancement(
                     model=ai_coustics.EnhancerModel.QUAIL_VF_S

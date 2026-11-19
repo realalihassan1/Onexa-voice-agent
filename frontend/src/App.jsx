@@ -1,26 +1,98 @@
 import { useEffect, useRef, useState } from 'react'
-import { Mic, MicOff, Phone, ShieldCheck, Sparkles, Volume2, X } from 'lucide-react'
+import { ArrowUpRight, LockKeyhole, Mic, MicOff, Phone, Radio, Sparkles, Volume2 } from 'lucide-react'
+import IntelligenceSphere from './IntelligenceSphere.jsx'
 import './App.css'
 
 const TOKEN_URL = import.meta.env.VITE_TOKEN_SERVER_URL || 'http://127.0.0.1:3000'
 const PEOPLE = ['Ali Hassan', 'Hamza']
+const MODE_LABELS = {
+  idle: 'STANDBY',
+  listening: 'LISTENING',
+  thinking: 'PROCESSING',
+  speaking: 'SPEAKING',
+}
 
-function Conversation({ onLeave, participantName }) {
-  const roomRef = useRef(null)
-  const agentTimeoutRef = useRef(null)
-  const [state, setState] = useState('connecting')
+function reportPerformance(stage, durationMs) {
+  if (import.meta.env.DEV && Number.isFinite(durationMs)) {
+    console.debug(`[ONEXA latency] ${stage}: ${Math.round(durationMs)} ms`)
+  }
+}
+
+function ONEXAStudioMark() {
+  return <span className="studio-mark" aria-hidden="true"><span>O</span><i /></span>
+}
+
+function App() {
+  const [participantName, setParticipantName] = useState(PEOPLE[0])
+  const [inSession, setInSession] = useState(false)
+  const [retryVersion, setRetryVersion] = useState(0)
+  const [connection, setConnection] = useState('idle')
+  const [mode, setMode] = useState('idle')
+  const [audioBlocked, setAudioBlocked] = useState(false)
   const [micEnabled, setMicEnabled] = useState(true)
   const [transcripts, setTranscripts] = useState([])
   const [error, setError] = useState('')
-  const [assistantSpeaking, setAssistantSpeaking] = useState(false)
   const [agentTarget, setAgentTarget] = useState('my-agent')
+  const audioOutputRef = useRef(null)
+  const roomRef = useRef(null)
+  const audioLevelRef = useRef(0)
+  const userSpokeRef = useRef(false)
+  const sessionStartedAtRef = useRef(0)
+  const speechStartedAtRef = useRef(0)
+  const speechEndedAtRef = useRef(0)
+  const firstUserTranscriptRef = useRef(false)
+  const firstAgentTextRef = useRef(false)
+  const firstAgentAudioRef = useRef(false)
+  const firstPlayerPlaybackRef = useRef(false)
+  const bootMeasuredRef = useRef(false)
 
   useEffect(() => {
+    if (bootMeasuredRef.current) return
+    bootMeasuredRef.current = true
+    const navigation = performance.getEntriesByType('navigation')[0]
+    const loadMs = navigation?.loadEventEnd ? navigation.loadEventEnd - navigation.startTime : performance.now()
+    reportPerformance('page navigation to app ready', loadMs)
+  }, [])
+
+  useEffect(() => {
+    if (!inSession) {
+      return undefined
+    }
+
     let mounted = true
     let currentRoom
+    let agentTimeout
+    let transcriptFlushTimer
+    const pendingTranscripts = new Map()
     const abortController = new AbortController()
 
+    function enqueueTranscript(entry) {
+      pendingTranscripts.set(entry.id, entry)
+      if (transcriptFlushTimer) return
+      transcriptFlushTimer = setTimeout(() => {
+        transcriptFlushTimer = 0
+        if (!mounted || pendingTranscripts.size === 0) return
+        const updates = [...pendingTranscripts.values()]
+        pendingTranscripts.clear()
+        setTranscripts((current) => {
+          const next = [...current]
+          for (const update of updates) {
+            const index = next.findIndex((item) => item.id === update.id)
+            if (index >= 0) next[index] = update
+            else next.push(update)
+          }
+          return next.slice(-6)
+        })
+      }, 50)
+    }
+
     async function connect() {
+      const connectStartedAt = performance.now()
+      setConnection('connecting')
+      setMode('idle')
+      setError('')
+      setTranscripts([])
+      userSpokeRef.current = false
       try {
         const { Room, RoomEvent, Track } = await import('livekit-client')
         const response = await fetch(`${TOKEN_URL}/getToken`, {
@@ -31,75 +103,149 @@ function Conversation({ onLeave, participantName }) {
         })
         const credentials = await response.json()
         if (!response.ok) throw new Error(credentials.detail || 'Could not connect to ONEXA.')
+        reportPerformance('token request', performance.now() - connectStartedAt)
         if (!mounted) return
         if (!credentials.room_name) throw new Error('The token service did not return a room name.')
         setAgentTarget(`${credentials.agent_name || 'my-agent'} · ${credentials.agent_deployment || 'unknown deployment'}`)
 
         currentRoom = new Room({ adaptiveStream: true, dynacast: true })
         roomRef.current = currentRoom
-
+        const localRoom = currentRoom
         currentRoom.on(RoomEvent.TrackSubscribed, (track) => {
-          if (track.kind === Track.Kind.Audio) {
-            document.getElementById('remote-audio')?.appendChild(track.attach())
+          if (track.kind === Track.Kind.Audio && audioOutputRef.current) {
+            const audioElement = track.attach()
+            audioElement.addEventListener('playing', () => {
+              if (!firstPlayerPlaybackRef.current) {
+                firstPlayerPlaybackRef.current = true
+                reportPerformance('session start to audio playback started', performance.now() - sessionStartedAtRef.current)
+              }
+            })
+            audioOutputRef.current.appendChild(audioElement)
           }
         })
-        currentRoom.on(RoomEvent.TrackUnsubscribed, (track) => track.detach())
-        currentRoom.on(RoomEvent.ParticipantConnected, () => {
-          clearTimeout(agentTimeoutRef.current)
-          if (mounted) setState('connected')
+        currentRoom.on(RoomEvent.TrackUnsubscribed, (track) => {
+          track.detach().forEach((element) => element.remove())
+        })
+        currentRoom.on(RoomEvent.AudioPlaybackStatusChanged, (playing) => {
+          if (mounted) setAudioBlocked(!playing)
+        })
+        currentRoom.on(RoomEvent.ParticipantConnected, (participant) => {
+          if (participant.identity !== localRoom.localParticipant.identity) {
+            clearTimeout(agentTimeout)
+            if (mounted) {
+              reportPerformance('session start to agent joined', performance.now() - sessionStartedAtRef.current)
+              setConnection('connected')
+              setMode('listening')
+            }
+          }
         })
         currentRoom.on(RoomEvent.ParticipantDisconnected, () => {
-          if (mounted && currentRoom.remoteParticipants.size === 0) {
-            setState('agent-missing')
-            setAssistantSpeaking(false)
+          if (mounted && localRoom.remoteParticipants.size === 0) {
+            clearTimeout(agentTimeout)
+            setConnection('agent-missing')
+            setMode('idle')
+            audioLevelRef.current = 0
           }
         })
         currentRoom.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
-          setAssistantSpeaking(speakers.some((speaker) => speaker.identity !== currentRoom.localParticipant.identity))
+          if (!mounted) return
+          const localIdentity = localRoom.localParticipant.identity
+          const localSpeaker = speakers.find((speaker) => speaker.identity === localIdentity)
+          const remoteSpeaker = speakers.find((speaker) => speaker.identity !== localIdentity)
+          const level = Math.max(0, ...speakers.map((speaker) => speaker.audioLevel || 0))
+          audioLevelRef.current = level
+
+          if (remoteSpeaker && remoteSpeaker.audioLevel > 0.015) {
+            if (!firstAgentAudioRef.current && speechEndedAtRef.current) {
+              firstAgentAudioRef.current = true
+              reportPerformance('user speech end to first remote audio activity', performance.now() - speechEndedAtRef.current)
+            }
+            userSpokeRef.current = false
+            setConnection('connected')
+            setMode('speaking')
+          } else if (localSpeaker && localSpeaker.audioLevel > 0.012) {
+            if (!userSpokeRef.current) {
+              speechStartedAtRef.current = performance.now()
+              speechEndedAtRef.current = 0
+              firstUserTranscriptRef.current = false
+              firstAgentTextRef.current = false
+              firstAgentAudioRef.current = false
+            }
+            userSpokeRef.current = true
+            setConnection('connected')
+            setMode('listening')
+          } else {
+            audioLevelRef.current = 0
+            if (userSpokeRef.current) {
+              userSpokeRef.current = false
+              speechEndedAtRef.current = performance.now()
+              setMode('thinking')
+            } else {
+              setMode((currentMode) => currentMode === 'speaking' || currentMode === 'idle' ? 'listening' : currentMode)
+            }
+          }
         })
-        currentRoom.on(RoomEvent.TranscriptionReceived, (segments, participant) => {
-          const speaker = participant?.identity === currentRoom.localParticipant.identity ? 'you' : 'onexa'
-          for (const segment of segments) {
-            if (!segment.text?.trim()) continue
-            setTranscripts((current) => {
-              const existing = current.findIndex((item) => item.id === segment.id)
-              const next = [...current]
-              const entry = { id: segment.id, speaker, text: segment.text, final: segment.final }
-              if (existing >= 0) next[existing] = entry
-              else next.push(entry)
-              return next.slice(-8)
-            })
+        currentRoom.registerTextStreamHandler('lk.transcription', async (reader, participantInfo) => {
+          const attributes = reader.info?.attributes || {}
+          const isTranscription = Boolean(attributes['lk.transcribed_track_id'])
+          if (!isTranscription) return
+
+          const speaker = participantInfo.identity === localRoom.localParticipant.identity ? 'you' : 'onexa'
+          const id = attributes['lk.segment_id'] || `${speaker}-${performance.now()}`
+          const final = attributes['lk.transcription_final'] === 'true'
+          let text = ''
+          try {
+            for await (const chunk of reader) {
+              text += chunk
+              if (!mounted) break
+              if (!text.trim()) continue
+              const entry = { id, speaker, text: text.trim(), final }
+              if (speaker === 'you' && !speechStartedAtRef.current) speechStartedAtRef.current = performance.now()
+              if (speaker === 'you' && !firstUserTranscriptRef.current) {
+                firstUserTranscriptRef.current = true
+                reportPerformance('user speech start to live transcript', performance.now() - speechStartedAtRef.current)
+              } else if (speaker === 'onexa' && !firstAgentTextRef.current && speechEndedAtRef.current) {
+                firstAgentTextRef.current = true
+                reportPerformance('user speech end to first response text', performance.now() - speechEndedAtRef.current)
+              }
+              enqueueTranscript(entry)
+            }
+          } catch (streamError) {
+            if (import.meta.env.DEV) console.debug('[ONEXA] Transcription stream ended early.', streamError)
           }
         })
         currentRoom.on(RoomEvent.Disconnected, () => {
           if (mounted) {
-            setState('ended')
-            setAssistantSpeaking(false)
+            setConnection('ended')
+            setMode('idle')
+            audioLevelRef.current = 0
           }
         })
 
         await currentRoom.connect(credentials.server_url, credentials.participant_token)
+        reportPerformance('token received to LiveKit connected', performance.now() - connectStartedAt)
         if (currentRoom.name !== credentials.room_name) {
           throw new Error('LiveKit connected to a different room than the token service created.')
         }
         await currentRoom.localParticipant.setMicrophoneEnabled(true)
-        if (mounted) {
-          if (currentRoom.remoteParticipants.size > 0) {
-            setState('connected')
-          } else {
-            setState('waiting-agent')
-            agentTimeoutRef.current = setTimeout(() => {
-              if (mounted && currentRoom.remoteParticipants.size === 0) {
-                setState('agent-missing')
-              }
-            }, 15000)
-          }
+        reportPerformance('session start to microphone ready', performance.now() - sessionStartedAtRef.current)
+        if (!mounted) return
+        if (currentRoom.remoteParticipants.size > 0) {
+          setConnection('connected')
+          setMode('listening')
+        } else {
+          setConnection('waiting-agent')
+          setMode('listening')
+          agentTimeout = setTimeout(() => {
+            if (mounted && currentRoom.remoteParticipants.size === 0) setConnection('agent-missing')
+          }, 15000)
         }
       } catch (connectError) {
         if (mounted && connectError.name !== 'AbortError') {
           await currentRoom?.disconnect()
           setError(connectError.message || 'Connection failed. Check that the ONEXA services are running.')
-          setState('error')
+          setConnection('error')
+          setMode('idle')
         }
       }
     }
@@ -108,111 +254,143 @@ function Conversation({ onLeave, participantName }) {
     return () => {
       mounted = false
       abortController.abort()
-      clearTimeout(agentTimeoutRef.current)
+      clearTimeout(agentTimeout)
+      clearTimeout(transcriptFlushTimer)
+      pendingTranscripts.clear()
       currentRoom?.disconnect()
       roomRef.current = null
     }
-  }, [participantName])
+  }, [inSession, participantName, retryVersion])
 
   async function toggleMicrophone() {
+    const room = roomRef.current
     const next = !micEnabled
     try {
-      await roomRef.current?.localParticipant.setMicrophoneEnabled(next)
+      await room?.localParticipant.setMicrophoneEnabled(next)
       setMicEnabled(next)
     } catch {
       setError('Could not change microphone access. Check your browser permissions.')
     }
   }
 
-  async function leave() {
-    await roomRef.current?.disconnect()
-    setState('ended')
-    onLeave()
+  async function enableAudio() {
+    try {
+      await roomRef.current?.startAudio()
+      setAudioBlocked(false)
+    } catch {
+      setError('Browser audio is still blocked. Check this site’s sound permission and try again.')
+    }
   }
 
-  const isLive = state === 'connected'
-  const isWaiting = state === 'waiting-agent'
-  const agentMissing = state === 'agent-missing'
-  const lastTranscript = transcripts.at(-1)
+  function beginSession() {
+    sessionStartedAtRef.current = performance.now()
+    speechStartedAtRef.current = 0
+    speechEndedAtRef.current = 0
+    firstUserTranscriptRef.current = false
+    firstAgentTextRef.current = false
+    firstAgentAudioRef.current = false
+    firstPlayerPlaybackRef.current = false
+    setMicEnabled(true)
+    setConnection('connecting')
+    setMode('idle')
+    audioLevelRef.current = 0
+    setError('')
+    setAudioBlocked(false)
+    if (inSession) setRetryVersion((version) => version + 1)
+    else setInSession(true)
+  }
+
+  function endSession() {
+    setInSession(false)
+    setConnection('ended')
+    setMode('idle')
+    audioLevelRef.current = 0
+  }
+
+  const active = inSession && ['connecting', 'waiting-agent', 'connected'].includes(connection)
+  const recoverable = inSession && ['agent-missing', 'error', 'ended'].includes(connection)
+  const subtitle = connection === 'connecting'
+    ? 'Opening a private intelligence channel'
+    : audioBlocked
+      ? 'Audio playback is paused. Enable speaker output to hear ONEXA.'
+      : connection === 'waiting-agent'
+      ? `Waiting for ${agentTarget} to join this room`
+      : connection === 'agent-missing'
+        ? `${agentTarget} did not join the room`
+        : connection === 'error'
+          ? error
+          : mode === 'speaking'
+            ? 'ONEXA is responding through your voice channel'
+            : mode === 'thinking'
+              ? 'Connecting your words with the right insight'
+              : mode === 'listening'
+                ? 'Speak naturally. ONEXA is listening.'
+                : 'Your personal intelligence, ready when you are.'
 
   return (
-    <main className="workspace">
+    <main className="onexa-app">
+      <div className="ambient ambient--left" />
+      <div className="ambient ambient--right" />
       <header className="topbar">
-        <a className="wordmark" href="#home" aria-label="ONEXA home"><span className="brand-mark">O</span> ONEXA</a>
-        <div className="topbar-right"><span className="privacy-label"><ShieldCheck size={15} /> Private session</span><span className="avatar">{participantName[0]}</span></div>
+        <a className="brand" href="#home" aria-label="ONEXA home"><ONEXAStudioMark /><span>ONEXA</span></a>
+        <div className="brand-descriptor">PERSONALIZED INTELLIGENCE <span>·</span> OPI</div>
+        <div className="topbar-right">
+          <span className={`connection-pill ${connection === 'connected' ? 'is-connected' : ''}`}><i />{connection === 'connected' ? 'LIVE SESSION' : connection === 'waiting-agent' ? 'CONNECTING' : 'PRIVATE SESSION'}</span>
+        </div>
       </header>
 
-      <div className="workspace-grid">
-        <aside className="sidebar">
-          <div className="sidebar-label">WORKSPACE</div>
-          <div className="side-current"><span className="side-dot" /> Voice assistant <span className="chevron">⌄</span></div>
-          <div className="sidebar-rule" />
-          <div className="sidebar-label">YOUR ONEXA</div>
-          <div className="memory-card"><span className="memory-icon"><Sparkles size={16} /></span><div><b>Business memory</b><small>Coming in a future phase</small></div></div>
-          <p className="sidebar-note">This session is not saved after you leave. ONEXA will be able to remember your work when its memory system is connected.</p>
-          <div className="sidebar-bottom"><span className="online-dot" /> Preview UI <span className="version">LOCAL</span></div>
-        </aside>
-
-        <section className="main-panel" aria-live="polite">
-          <div className="session-meta"><span className={`session-dot ${isLive ? 'active' : ''}`} />{state === 'connecting' ? 'Connecting securely' : isWaiting ? 'ROOM CONNECTED · WAITING FOR AGENT' : isLive ? 'VOICE SESSION' : agentMissing ? 'AGENT NOT CONNECTED' : state === 'error' ? 'CONNECTION ISSUE' : 'SESSION ENDED'}</div>
-          <div className={`orb-wrap ${assistantSpeaking ? 'speaking' : ''}`}>
-            <div className="orb-halo" /><div className="orb"><span className="orb-core" /><span className="orb-wave wave-one" /><span className="orb-wave wave-two" /><span className="orb-wave wave-three" /></div>
-          </div>
-          <h1>{state === 'connecting' ? 'Joining your space…' : isWaiting ? 'Connecting to ONEXA…' : isLive ? assistantSpeaking ? 'ONEXA is speaking' : 'I’m here, ' + participantName.split(' ')[0] : agentMissing ? 'ONEXA hasn’t joined yet' : state === 'error' ? 'Let’s get you connected' : 'Until next time'}</h1>
-          <p className="subtitle">{state === 'connecting' ? 'Opening a private voice session' : isWaiting ? `Room connected. Waiting for ${agentTarget}.` : isLive ? assistantSpeaking ? 'Listening to your response is paused while I speak.' : 'Speak naturally. I’m listening.' : agentMissing ? `The browser joined the room, but ${agentTarget} did not. Check the worker deployment and dispatch target.` : state === 'error' ? error : 'Your conversation has ended.'}</p>
-
-          <div className="live-caption" aria-live="polite">
-            {lastTranscript ? <><span className="caption-speaker">{lastTranscript.speaker === 'you' ? 'YOU' : 'ONEXA'}</span><span>{lastTranscript.text}</span></> : <><Volume2 size={16} /><span>{isLive ? 'Your conversation will appear here' : 'Voice activity and transcription appear here'}</span></>}
-          </div>
-
-          {state === 'error' ? <div className="error-box"><b>Connection didn’t start</b><span>{error}</span><small>Start the Python agent and token service, then refresh this page.</small></div> : null}
-          {agentMissing ? <div className="error-box"><b>Voice agent not connected</b><span>The room is open, but {agentTarget} did not join it.</span><small>Start the existing agent with <code>lk agent dev --deployment onexa-dev</code> and confirm it registers in the same LiveKit project.</small></div> : null}
-
-          <div className="call-controls">
-            <div className="control-spacer" />
-            <button className={`mic-button ${!micEnabled ? 'muted' : ''}`} onClick={toggleMicrophone} disabled={!isLive} aria-label={micEnabled ? 'Mute microphone' : 'Unmute microphone'} title={micEnabled ? 'Mute microphone' : 'Unmute microphone'}>{micEnabled ? <Mic size={22} /> : <MicOff size={22} />}</button>
-            {isLive ? <button className="end-button" onClick={leave}><Phone size={17} /> End session</button> : <button className="end-button secondary" onClick={onLeave}><X size={17} /> Back</button>}
-            <div className="control-spacer" />
-          </div>
-          <div className="control-hint">{isLive ? micEnabled ? 'Microphone on' : 'Microphone muted' : 'Browser microphone required'}</div>
-          <div id="remote-audio" className="audio-output" />
-        </section>
-
-        <aside className="right-rail">
-          <div className="rail-heading"><span>SESSION NOTES</span><span className="rail-count">01</span></div>
-          <div className="note-card"><div className="note-icon"><Sparkles size={16} /></div><div><b>Business context</b><p>Share an idea, plan a project, or think through a decision with ONEXA.</p></div></div>
-          <div className="note-card subtle"><div className="note-icon muted-icon"><ShieldCheck size={16} /></div><div><b>Session privacy</b><p>This call uses your existing LiveKit voice agent. Long-term recall is not active yet.</p></div></div>
-          <div className="rail-footer">ONEXA · VOICE PREVIEW</div>
-        </aside>
-      </div>
-    </main>
-  )
-}
-
-function App() {
-  const [participantName, setParticipantName] = useState(PEOPLE[0])
-  const [inSession, setInSession] = useState(false)
-
-  if (inSession) return <Conversation participantName={participantName} onLeave={() => setInSession(false)} />
-
-  return (
-    <main className="landing">
-      <header className="landing-top"><a className="wordmark" href="#home"><span className="brand-mark">O</span> ONEXA</a><span className="preview-chip"><span /> PERSONAL AI · VOICE PREVIEW</span></header>
-      <div className="landing-content">
-        <div className="landing-copy">
-          <div className="eyebrow"><span /> YOUR PERSONAL AI MANAGER</div>
-          <h1>Make room for<br /><em>what matters.</em></h1>
-          <p className="landing-description">A clear head for your biggest ideas. Talk through work, projects and plans with ONEXA, your voice-first AI assistant.</p>
-          <div className="start-card">
-            <label htmlFor="participant">START A PRIVATE SESSION</label>
-            <div className="start-row"><div className="select-wrap"><span className="select-avatar">{participantName[0]}</span><select id="participant" value={participantName} onChange={(event) => setParticipantName(event.target.value)}>{PEOPLE.map((person) => <option key={person}>{person}</option>)}</select></div><button className="start-button" onClick={() => setInSession(true)}>Start talking <span>↗</span></button></div>
-            <div className="secure-note"><ShieldCheck size={14} /> Your voice connects directly to your private LiveKit session.</div>
-          </div>
-          <div className="feature-row"><div><span className="feature-symbol">◉</span><b>Natural voice</b><small>Talk like you think</small></div><div><span className="feature-symbol">✳</span><b>Business-minded</b><small>Ideas to action</small></div><div><span className="feature-symbol">⌘</span><b>Built for two</b><small>Ali &amp; Hamza</small></div></div>
+      <section className="experience" aria-live="polite">
+        <div className="intro-copy">
+          <div className="eyebrow"><span /> INTELLIGENCE WITH PURPOSE</div>
+          <h1>Beyond<br /><em>what exists.</em></h1>
+          <p>A more personal kind of intelligence. Talk through the ideas, decisions, and work that move you forward.</p>
+          <div className="intro-index"><span>01</span><i /> OPI / VOICE SYSTEM</div>
         </div>
-        <div className="landing-visual" aria-hidden="true"><div className="visual-orbit orbit-a" /><div className="visual-orbit orbit-b" /><div className="visual-orbit orbit-c" /><div className="visual-orb"><div className="visual-glow" /><span className="visual-ripple ripple-a" /><span className="visual-ripple ripple-b" /><span className="visual-ripple ripple-c" /></div><div className="visual-label label-left"><span className="visual-point" /> READY WHEN YOU ARE</div><div className="visual-label label-right">THOUGHTFUL BY DESIGN <span className="visual-point" /></div><div className="visual-caption">A more considered way to work.<br /><span>One conversation at a time.</span></div></div>
-      </div>
-      <footer className="landing-footer"><span>DESIGNED FOR CLEARER THINKING</span><span>MADE FOR ALI &amp; HAMZA <i>·</i> 2026</span></footer>
+
+        <div className="sphere-stage">
+          <div className="stage-ring stage-ring--outer" />
+          <div className="stage-ring stage-ring--inner" />
+          <div className="sphere-kicker"><Sparkles size={13} /> ONEXA INTELLIGENCE</div>
+          <IntelligenceSphere mode={inSession ? mode : 'idle'} audioLevelRef={audioLevelRef} />
+          <div className="sphere-caption"><span className="caption-line" /> OPI <span className="caption-dot">·</span> ONEXA PERSONALIZED INTELLIGENCE <span className="caption-line" /></div>
+        </div>
+
+        <aside className="session-aside">
+          <div className="aside-label">SYSTEM STATE <span>01 / 01</span></div>
+          <div className="state-readout"><span className={`state-beacon state-beacon--${mode}`} /><div><small>{inSession ? 'VOICE AGENT' : 'OPI SYSTEM'}</small><b>{inSession ? MODE_LABELS[mode] : 'STANDBY'}</b></div><Radio size={15} /></div>
+          <p className="state-description">{subtitle}</p>
+          <div className="aside-rule" />
+          <div className="aside-label transcript-label">LIVE TRANSCRIPT <Volume2 size={13} /></div>
+          {transcripts.length ? (
+            <div className="transcript-list">
+              {transcripts.slice(-3).map((item) => <div className={`transcript-entry transcript-entry--${item.speaker}`} key={item.id}><span>{item.speaker === 'you' ? 'YOU' : 'ONEXA'}</span><p>{item.text}</p></div>)}
+            </div>
+          ) : (
+            <div className="transcript-empty"><span>—</span><p>{inSession ? 'Your conversation will appear here.' : 'Ideas become clearer when you say them out loud.'}</p></div>
+          )}
+          {connection === 'agent-missing' || connection === 'error' ? <div className="inline-error">{error || `Start the worker with the same deployment as ${agentTarget}.`}</div> : null}
+        </aside>
+      </section>
+
+      <footer className="control-dock">
+        <div className="dock-context"><LockKeyhole size={13} /><span>PRIVATE LIVEKIT ROOM</span></div>
+        <div className="dock-actions">
+          {active ? <>
+            {audioBlocked ? <button className="session-button" onClick={enableAudio}><Volume2 size={16} /><span>ENABLE AUDIO</span></button> : null}
+            <button className={`mic-control ${!micEnabled ? 'is-muted' : ''}`} onClick={toggleMicrophone} disabled={connection !== 'connected'} aria-label={micEnabled ? 'Mute microphone' : 'Unmute microphone'} title={micEnabled ? 'Mute microphone' : 'Unmute microphone'}>{micEnabled ? <Mic size={18} /> : <MicOff size={18} />}</button>
+            <button className="session-button session-button--end" onClick={endSession}><Phone size={16} /> END SESSION</button>
+          </> : recoverable ? <>
+            <button className="session-button session-button--end" onClick={endSession}>CLOSE</button>
+            <button className="session-button" onClick={beginSession}><span className="button-orb" /><span>RETRY SESSION</span><ArrowUpRight size={16} /></button>
+          </> : <>
+            <label className="participant-select" htmlFor="participant-name"><span>SESSION FOR</span><select id="participant-name" value={participantName} onChange={(event) => setParticipantName(event.target.value)}>{PEOPLE.map((person) => <option key={person}>{person}</option>)}</select></label>
+            <button className="session-button" onClick={beginSession}><span className="button-orb" /><span>START A SESSION</span><ArrowUpRight size={16} /></button>
+          </>}
+        </div>
+        <div className="dock-note"><span className={`dock-indicator ${active ? 'is-active' : ''}`} /> {active ? connection === 'connected' ? 'AGENT CONNECTED' : connection === 'waiting-agent' ? 'JOINING ONEXA' : 'OPENING CHANNEL' : 'READY WHEN YOU ARE'}</div>
+      </footer>
+      <div className="session-error" aria-live="polite">{connection === 'agent-missing' ? `The room connected, but ${agentTarget} did not join. Confirm the worker is running with --deployment onexa-dev.` : ''}</div>
+      <div ref={audioOutputRef} className="audio-output" />
     </main>
   )
 }
