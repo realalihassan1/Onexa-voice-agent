@@ -5,7 +5,15 @@ import time
 import pytest
 from fastapi import HTTPException
 
+import database
 from token_server import TokenRequest, get_token
+
+
+@pytest.fixture(autouse=True)
+def isolated_database(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "token.sqlite3")
+    database.initialize()
+    database.create_user("ali-id", "ali", "Ali", "hash")
 
 
 def decode_payload(token: str) -> dict:
@@ -22,11 +30,11 @@ async def test_token_dispatches_to_onexa_agent(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("LIVEKIT_AGENT_DEPLOYMENT", "onexa-dev")
 
     now = time.time()
-    response = await get_token(TokenRequest(participant_name="Ali Hassan"))
+    response = await get_token(TokenRequest(), {"id": "ali-id", "display_name": "Ali"})
     claims = decode_payload(response["participant_token"])
 
     assert response["server_url"] == "wss://example.livekit.cloud"
-    assert claims["name"] == "Ali Hassan"
+    assert claims["name"] == "Ali"
     assert claims["video"]["roomJoin"] is True
     assert claims["video"]["room"].startswith("onexa-")
     assert response["room_name"] == claims["video"]["room"]
@@ -38,7 +46,7 @@ async def test_token_dispatches_to_onexa_agent(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
-async def test_token_server_rejects_unknown_display_names(
+async def test_token_identity_comes_from_authenticated_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LIVEKIT_URL", "wss://example.livekit.cloud")
@@ -46,10 +54,9 @@ async def test_token_server_rejects_unknown_display_names(
     monkeypatch.setenv("LIVEKIT_API_SECRET", "devsecret123456789012345678901234")
     monkeypatch.setenv("LIVEKIT_AGENT_DEPLOYMENT", "onexa-dev")
 
-    with pytest.raises(HTTPException) as error:
-        await get_token(TokenRequest(participant_name="Guest"))
-
-    assert error.value.status_code == 422
+    response = await get_token(TokenRequest(), {"id": "ali-id", "display_name": "Ali"})
+    claims = decode_payload(response["participant_token"])
+    assert claims["name"] == "Ali"
 
 
 @pytest.mark.asyncio
@@ -62,7 +69,7 @@ async def test_token_service_fails_cleanly_without_livekit_config(
     monkeypatch.setenv("LIVEKIT_AGENT_DEPLOYMENT", "onexa-dev")
 
     with pytest.raises(HTTPException) as error:
-        await get_token(TokenRequest(participant_name="Hamza"))
+        await get_token(TokenRequest(), {"id": "ali-id", "display_name": "Ali"})
 
     assert error.value.status_code == 503
 
@@ -77,7 +84,7 @@ async def test_token_service_requires_explicit_agent_deployment(
     monkeypatch.delenv("LIVEKIT_AGENT_DEPLOYMENT", raising=False)
 
     with pytest.raises(HTTPException) as error:
-        await get_token(TokenRequest(participant_name="Ali Hassan"))
+        await get_token(TokenRequest(), {"id": "ali-id", "display_name": "Ali"})
 
     assert error.value.status_code == 503
     assert "LIVEKIT_AGENT_DEPLOYMENT" in error.value.detail

@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { ArrowUpRight, LockKeyhole, Mic, MicOff, Phone, Radio, Sparkles, Volume2 } from 'lucide-react'
 import IntelligenceSphere from './IntelligenceSphere.jsx'
+import ChatWorkspace, { SignIn } from './ChatWorkspace.jsx'
 import './App.css'
 
-const TOKEN_URL = import.meta.env.VITE_TOKEN_SERVER_URL || 'http://127.0.0.1:3000'
-const PEOPLE = ['Ali Hassan', 'Hamza']
+const TOKEN_URL = import.meta.env.VITE_TOKEN_SERVER_URL || `${window.location.protocol}//${window.location.hostname}:3000`
+const savedTranscriptUpdates = new Map()
+const transcriptSaveTimers = new Map()
+const transcriptSaveChains = new Map()
 const MODE_LABELS = {
   idle: 'STANDBY',
   listening: 'LISTENING',
@@ -18,12 +21,30 @@ function reportPerformance(stage, durationMs) {
   }
 }
 
+function persistVoiceTranscript(conversationId, entry) {
+  const key = `${conversationId}:${entry.id}`
+  savedTranscriptUpdates.set(key, { conversationId, entry })
+  if (transcriptSaveTimers.has(key)) return
+  transcriptSaveTimers.set(key, setTimeout(() => {
+    transcriptSaveTimers.delete(key)
+    const latest = savedTranscriptUpdates.get(key)
+    savedTranscriptUpdates.delete(key)
+    const previous = transcriptSaveChains.get(key) || Promise.resolve()
+    const next = previous.catch(() => {}).then(() => fetch(`${TOKEN_URL}/api/conversations/${latest.conversationId}/messages`, {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: latest.entry.speaker === 'you' ? 'user' : 'assistant', content: latest.entry.text, source: 'voice', segment_id: latest.entry.id }),
+    })).then(async (response) => { if (!response.ok) throw new Error(`Transcript save failed (${response.status}).`) })
+      .catch((error) => console.error('Could not save voice transcript.', error))
+      .finally(() => { if (transcriptSaveChains.get(key) === next) transcriptSaveChains.delete(key) })
+    transcriptSaveChains.set(key, next)
+  }, 200))
+}
+
 function ONEXAStudioMark() {
   return <span className="studio-mark" aria-hidden="true"><span>O</span><i /></span>
 }
 
-function App() {
-  const [participantName, setParticipantName] = useState(PEOPLE[0])
+function VoiceExperience({ user, onLogout, onChat, conversationId: initialConversationId }) {
   const [inSession, setInSession] = useState(false)
   const [retryVersion, setRetryVersion] = useState(0)
   const [connection, setConnection] = useState('idle')
@@ -35,6 +56,8 @@ function App() {
   const [agentTarget, setAgentTarget] = useState('my-agent')
   const audioOutputRef = useRef(null)
   const roomRef = useRef(null)
+  const activeConversationRef = useRef(initialConversationId)
+  const activeVoiceSessionRef = useRef(null)
   const audioLevelRef = useRef(0)
   const userSpokeRef = useRef(false)
   const sessionStartedAtRef = useRef(0)
@@ -98,7 +121,8 @@ function App() {
         const response = await fetch(`${TOKEN_URL}/getToken`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ participant_name: participantName }),
+          credentials: 'include',
+          body: JSON.stringify({ conversation_id: activeConversationRef.current }),
           signal: abortController.signal,
         })
         const credentials = await response.json()
@@ -106,6 +130,8 @@ function App() {
         reportPerformance('token request', performance.now() - connectStartedAt)
         if (!mounted) return
         if (!credentials.room_name) throw new Error('The token service did not return a room name.')
+        activeConversationRef.current = credentials.conversation_id
+        activeVoiceSessionRef.current = credentials.voice_session_id
         setAgentTarget(`${credentials.agent_name || 'my-agent'} · ${credentials.agent_deployment || 'unknown deployment'}`)
 
         currentRoom = new Room({ adaptiveStream: true, dynacast: true })
@@ -191,7 +217,7 @@ function App() {
           if (!isTranscription) return
 
           const speaker = participantInfo.identity === localRoom.localParticipant.identity ? 'you' : 'onexa'
-          const id = attributes['lk.segment_id'] || `${speaker}-${performance.now()}`
+          const id = `${participantInfo.identity}:${attributes['lk.segment_id'] || performance.now()}`
           const final = attributes['lk.transcription_final'] === 'true'
           let text = ''
           try {
@@ -209,12 +235,16 @@ function App() {
                 reportPerformance('user speech end to first response text', performance.now() - speechEndedAtRef.current)
               }
               enqueueTranscript(entry)
+              persistVoiceTranscript(activeConversationRef.current, entry)
             }
           } catch (streamError) {
             if (import.meta.env.DEV) console.debug('[ONEXA] Transcription stream ended early.', streamError)
           }
         })
         currentRoom.on(RoomEvent.Disconnected, () => {
+          if (activeVoiceSessionRef.current) {
+            fetch(`${TOKEN_URL}/api/voice-sessions/${activeVoiceSessionRef.current}/close`, { method: 'POST', credentials: 'include' }).catch(() => {})
+          }
           if (mounted) {
             setConnection('ended')
             setMode('idle')
@@ -223,6 +253,9 @@ function App() {
         })
 
         await currentRoom.connect(credentials.server_url, credentials.participant_token)
+        if (activeVoiceSessionRef.current) {
+          fetch(`${TOKEN_URL}/api/voice-sessions/${activeVoiceSessionRef.current}/connected`, { method: 'POST', credentials: 'include' }).catch(() => {})
+        }
         reportPerformance('token received to LiveKit connected', performance.now() - connectStartedAt)
         if (currentRoom.name !== credentials.room_name) {
           throw new Error('LiveKit connected to a different room than the token service created.')
@@ -241,6 +274,9 @@ function App() {
           }, 15000)
         }
       } catch (connectError) {
+        if (activeVoiceSessionRef.current) {
+          fetch(`${TOKEN_URL}/api/voice-sessions/${activeVoiceSessionRef.current}/failed`, { method: 'POST', credentials: 'include' }).catch(() => {})
+        }
         if (mounted && connectError.name !== 'AbortError') {
           await currentRoom?.disconnect()
           setError(connectError.message || 'Connection failed. Check that the ONEXA services are running.')
@@ -260,7 +296,7 @@ function App() {
       currentRoom?.disconnect()
       roomRef.current = null
     }
-  }, [inSession, participantName, retryVersion])
+  }, [inSession, retryVersion])
 
   async function toggleMicrophone() {
     const room = roomRef.current
@@ -301,6 +337,8 @@ function App() {
   }
 
   function endSession() {
+    const voiceSessionId = activeVoiceSessionRef.current
+    if (voiceSessionId) fetch(`${TOKEN_URL}/api/voice-sessions/${voiceSessionId}/close`, { method: 'POST', credentials: 'include' }).catch(() => {})
     setInSession(false)
     setConnection('ended')
     setMode('idle')
@@ -335,6 +373,8 @@ function App() {
         <a className="brand" href="#home" aria-label="ONEXA home"><ONEXAStudioMark /><span>ONEXA</span></a>
         <div className="brand-descriptor">PERSONALIZED INTELLIGENCE <span>·</span> OPI</div>
         <div className="topbar-right">
+          <button className="session-button" onClick={() => { if (inSession) endSession(); onChat() }}>CHAT HISTORY</button>
+          <button className="session-button" onClick={() => { endSession(); onLogout() }}>SIGN OUT · {user.display_name.toUpperCase()}</button>
           <span className={`connection-pill ${connection === 'connected' ? 'is-connected' : ''}`}><i />{connection === 'connected' ? 'LIVE SESSION' : connection === 'waiting-agent' ? 'CONNECTING' : 'PRIVATE SESSION'}</span>
         </div>
       </header>
@@ -383,7 +423,7 @@ function App() {
             <button className="session-button session-button--end" onClick={endSession}>CLOSE</button>
             <button className="session-button" onClick={beginSession}><span className="button-orb" /><span>RETRY SESSION</span><ArrowUpRight size={16} /></button>
           </> : <>
-            <label className="participant-select" htmlFor="participant-name"><span>SESSION FOR</span><select id="participant-name" value={participantName} onChange={(event) => setParticipantName(event.target.value)}>{PEOPLE.map((person) => <option key={person}>{person}</option>)}</select></label>
+            <label className="participant-select"><span>PRIVATE SESSION FOR</span><b>{user.display_name}</b></label>
             <button className="session-button" onClick={beginSession}><span className="button-orb" /><span>START A SESSION</span><ArrowUpRight size={16} /></button>
           </>}
         </div>
@@ -395,4 +435,24 @@ function App() {
   )
 }
 
-export default App
+export default function App() {
+  const [user, setUser] = useState(null)
+  const [authChecked, setAuthChecked] = useState(false)
+  const [view, setView] = useState('chat')
+  const [voiceConversationId, setVoiceConversationId] = useState(null)
+  useEffect(() => {
+    fetch(`${TOKEN_URL}/api/auth/me`, { credentials: 'include' })
+      .then((response) => response.ok ? response.json() : null)
+      .then((result) => setUser(result?.user || null))
+      .catch(() => setUser(null))
+      .finally(() => setAuthChecked(true))
+  }, [])
+  async function logout() {
+    await fetch(`${TOKEN_URL}/api/auth/logout`, { method: 'POST', credentials: 'include' })
+    setUser(null); setView('chat')
+  }
+  if (!authChecked) return <main className="onex-chat signin-screen"><p>Loading your workspace…</p></main>
+  if (!user) return <SignIn onSignedIn={setUser} />
+  if (view === 'chat') return <ChatWorkspace user={user} onLogout={logout} onVoice={(id) => { setVoiceConversationId(id); setView('voice') }} />
+  return <VoiceExperience user={user} onLogout={logout} onChat={() => setView('chat')} conversationId={voiceConversationId} />
+}

@@ -1,10 +1,16 @@
-# ONEXA voice preview
+# ONEXAI Intelligence
 
-ONEXA is a browser based voice assistant for Ali and Hamza. This repository keeps the existing LiveKit Python agent and adds a React browser client plus a local token service. The browser connects to the existing agent through LiveKit; LiveKit API credentials stay on the Python server.
+ONEXAI is a browser based chat and voice assistant for Ali and Hamza. It keeps the existing LiveKit Python agent and React client, and adds server verified accounts, persistent SQLite conversations, and Gemini text chat. LiveKit and Google credentials stay on the Python server.
 
 ## Start ONEXA locally
 
-Make sure `.env.local` in the project root contains `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, and `LIVEKIT_AGENT_DEPLOYMENT=onexa-dev`. Keep the API key and secret in that file only; never copy them into the frontend or commit them.
+Copy `.env.example` to `.env.local`. Configure the LiveKit values and `GOOGLE_API_KEY`; the key stays in the backend file and must never be copied into frontend environment variables. The default chat model is `gemini-3.8-flash` and can be changed with `GEMINI_MODEL`.
+
+Create the two password protected accounts once from the project root. Passwords are prompted securely and stored using salted scrypt hashes:
+
+```powershell
+uv run python src/setup_users.py
+```
 
 Open three PowerShell terminals in the project root and run:
 
@@ -28,19 +34,21 @@ Open three PowerShell terminals in the project root and run:
    npm run dev
    ```
 
-Open the local URL printed by Vite, normally `http://localhost:5173`. Choose a name and select **Start talking**. Allow microphone access when the browser asks. ONEXA voice audio and available agent transcriptions appear in the session view. Use the microphone control to mute and **End session** to disconnect.
+Open the local URL printed by Vite, normally `http://localhost:5173`, and sign in as Ali or Hamza. Use **New chat** for streamed Gemini text chat or **Start voice session** to connect to the existing LiveKit agent. Allow microphone access when prompted. A voice conversation can be reopened from history and continued in chat.
 
 The worker and token service use the same stable, named development deployment, `onexa-dev`. `lk agent dev` otherwise creates a new random `dev-*` deployment, while dispatches that omit a deployment target `production`; that mismatch leaves the browser room open without an agent. The token service now includes the configured deployment in its automatic room dispatch, and `/health` reports the configured target without exposing credentials. A successful room connection is not counted as an agent connection: the frontend waits for the agent participant.
 
-The token service binds to `127.0.0.1:3000` and allows browser requests only from the local Vite origins. It creates a random room per session and dispatches the existing `my-agent` to that same room. It is a development service, with no account authentication; do not expose it to the internet or another device. Add real authentication before deployment or network use.
+The token service binds to `127.0.0.1:3000`, requires a server verified HTTP-only session cookie, and allows browser requests only from local Vite origins. It creates a random room per session and dispatches the existing `my-agent` to that room. The local SQLite database is stored at `data/onexai.sqlite3`; override it with `ONEXA_DATABASE_PATH`. Set `COOKIE_SECURE=true` when serving over HTTPS.
 
 ## Current scope
 
 - Browser voice connection to the existing LiveKit agent.
-- Ali/Hamza display-name selection for local testing. This is not login and does not verify identity.
+- Independent Ali/Hamza accounts with salted scrypt password hashes and revocable server-side sessions.
 - Short-lived LiveKit room credentials created server-side.
-- Session-only display of transcriptions when provided by the agent.
-- Long-term memory, persisted conversation history, wake word, authentication, and Excel/CRM tools are not implemented yet. The UI identifies memory as unavailable and does not claim to save the conversation.
+- Owner scoped SQLite conversations and ordered chat/voice messages, search, pagination, and deletion.
+- Gemini streamed chat through a backend provider interface.
+- LiveKit transcript segment persistence into the same conversation and message store used by chat.
+- Long term personal memory, shared business knowledge, wake word, and Excel/CRM tools remain future work.
 
 ## Tests and checks
 
@@ -64,3 +72,7 @@ The existing LiveKit starter also includes cloud based conversation simulations 
 ## Existing voice stack
 
 The agent in `src/agent.py` retains LiveKit Inference Gemma 4 31B, AssemblyAI realtime transcription, Fish Audio speech, LiveKit turn detection, expressive audio, and AIcoustics noise cancellation. The ONEXA instructions are already part of that agent. The browser client does not replace those services.
+
+## Gemini model
+
+The backend adapter uses Google’s documented Gemini streaming REST endpoint. Google currently lists stable `gemini-3.8-flash` with text output support; the model is configurable using `GEMINI_MODEL`. See [Gemini model details](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash) and the [streaming text API](https://ai.google.dev/gemini-api/docs/text-generation).
